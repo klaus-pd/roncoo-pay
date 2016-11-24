@@ -23,6 +23,7 @@ import com.roncoo.pay.common.core.utils.StringUtil;
 import com.roncoo.pay.notify.service.RpNotifyService;
 import com.roncoo.pay.trade.dao.RpTradePaymentOrderDao;
 import com.roncoo.pay.trade.dao.RpTradePaymentRecordDao;
+import com.roncoo.pay.trade.entity.RoncooPayGoodsDetails;
 import com.roncoo.pay.trade.entity.RpTradePaymentOrder;
 import com.roncoo.pay.trade.entity.RpTradePaymentRecord;
 import com.roncoo.pay.trade.entity.weixinpay.WeiXinPrePay;
@@ -38,8 +39,10 @@ import com.roncoo.pay.trade.utils.MerchantApiUtil;
 import com.roncoo.pay.trade.utils.WeiXinPayUtils;
 import com.roncoo.pay.trade.utils.WeixinConfigUtil;
 import com.roncoo.pay.trade.utils.alipay.config.AlipayConfigUtil;
+import com.roncoo.pay.trade.utils.alipay.f2fpay.AliF2FPaySubmit;
 import com.roncoo.pay.trade.utils.alipay.util.AlipayNotify;
 import com.roncoo.pay.trade.utils.alipay.util.AlipaySubmit;
+import com.roncoo.pay.trade.vo.F2FPayResultVo;
 import com.roncoo.pay.trade.vo.OrderPayResultVo;
 import com.roncoo.pay.trade.vo.RpPayGateWayPageShowVo;
 import com.roncoo.pay.trade.vo.ScanPayResultVo;
@@ -100,6 +103,9 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
     @Autowired
     private RpAccountTransactionService rpAccountTransactionService;
 
+    @Autowired
+    private AliF2FPaySubmit aliF2FPaySubmit;
+
     /**
      * 初始化直连扫码支付数据,直连扫码支付初始化方法规则
      * 1:根据(商户编号 + 商户订单号)确定订单是否存在
@@ -138,10 +144,13 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
 
         //根据支付产品及支付方式获取费率
         RpPayWay payWay = null;
+        PayTypeEnum payType = null;
         if (PayWayEnum.WEIXIN.name().equals(payWayCode)){
             payWay = rpPayWayService.getByPayWayTypeCode(rpUserPayConfig.getProductCode(), payWayCode, PayTypeEnum.SCANPAY.name());
+            payType = PayTypeEnum.SCANPAY;
         }else if (PayWayEnum.ALIPAY.name().equals(payWayCode)){
             payWay = rpPayWayService.getByPayWayTypeCode(rpUserPayConfig.getProductCode(), payWayCode, PayTypeEnum.DIRECT_PAY.name());
+            payType = PayTypeEnum.DIRECT_PAY;
         }
 
         if(payWay == null){
@@ -157,7 +166,78 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
 
         RpTradePaymentOrder rpTradePaymentOrder = rpTradePaymentOrderDao.selectByMerchantNoAndMerchantOrderNo(merchantNo, orderNo);
         if (rpTradePaymentOrder == null){
-            rpTradePaymentOrder = sealRpTradePaymentOrder( merchantNo,  rpUserInfo.getUserName() , productName,  orderNo,  orderDate,  orderTime,  orderPrice, payWayCode, PayWayEnum.getEnum(payWayCode).getDesc() ,  rpUserPayConfig.getFundIntoType() ,  orderIp,  orderPeriod,  returnUrl,  notifyUrl,  remark,  field1,  field2,  field3,  field4,  field5);
+            rpTradePaymentOrder = sealRpTradePaymentOrder( merchantNo,  rpUserInfo.getUserName() , productName,  orderNo,  orderDate,  orderTime,  orderPrice, payWayCode, PayWayEnum.getEnum(payWayCode).getDesc() , payType, rpUserPayConfig.getFundIntoType() ,  orderIp,  orderPeriod,  returnUrl,  notifyUrl,  remark,  field1,  field2,  field3,  field4,  field5);
+            rpTradePaymentOrderDao.insert(rpTradePaymentOrder);
+        }else{
+
+            if (TradeStatusEnum.SUCCESS.name().equals(rpTradePaymentOrder.getStatus())){
+                throw new TradeBizException(TradeBizException.TRADE_ORDER_ERROR,"订单已支付成功,无需重复支付");
+            }
+
+            if (rpTradePaymentOrder.getOrderAmount().compareTo(orderPrice) != 0 ){
+                rpTradePaymentOrder.setOrderAmount(orderPrice);//如果金额不一致,修改金额为最新的金额
+            }
+        }
+
+        return getScanPayResultVo(rpTradePaymentOrder , payWay);
+
+    }
+
+    /**
+     * 条码支付,对应的是支付宝的条码支付或者微信的刷卡支付
+     *
+     * @param payKey      商户支付key
+     * @param authCode    支付授权码
+     * @param productName 产品名称
+     * @param orderNo     商户订单号
+     * @param orderDate   下单日期
+     * @param orderTime   下单时间
+     * @param orderPrice  订单金额(元)
+     * @param payWayCode  支付方式
+     * @param orderIp     下单IP
+     * @param remark      支付备注
+     * @param field1      扩展字段1
+     * @param field2      扩展字段2
+     * @param field3      扩展字段3
+     * @param field4      扩展字段4
+     * @param field5      扩展字段5
+     * @return
+     */
+    @Override
+    public F2FPayResultVo f2fPay(String payKey, String authCode, String productName, String orderNo, Date orderDate, Date orderTime, BigDecimal orderPrice, String payWayCode, String orderIp, String remark, String field1, String field2, String field3, String field4, String field5) {
+
+        RpUserPayConfig rpUserPayConfig = rpUserPayConfigService.getByPayKey(payKey);
+        if (rpUserPayConfig == null){
+            throw new UserBizException(UserBizException.USER_PAY_CONFIG_ERRPR,"用户支付配置有误");
+        }
+
+        if (StringUtil.isEmpty(authCode)){
+            throw new TradeBizException(TradeBizException.TRADE_PARAM_ERROR,"支付授权码不能为空");
+        }
+        //根据支付产品及支付方式获取费率
+        RpPayWay payWay = null;
+        PayTypeEnum payType = null;
+        if (PayWayEnum.WEIXIN.name().equals(payWayCode)){
+//            payWay = rpPayWayService.getByPayWayTypeCode(rpUserPayConfig.getProductCode(), payWayCode, PayTypeEnum.SCANPAY.name());
+            payType = PayTypeEnum.SCANPAY;//TODO 具体需要根据接口修改
+        }else if (PayWayEnum.ALIPAY.name().equals(payWayCode)){
+            payWay = rpPayWayService.getByPayWayTypeCode(rpUserPayConfig.getProductCode(), payWayCode, PayTypeEnum.F2F_PAY.name());
+            payType = PayTypeEnum.F2F_PAY;
+        }
+
+        if(payWay == null){
+            throw new UserBizException(UserBizException.USER_PAY_CONFIG_ERRPR,"用户支付配置有误");
+        }
+
+        String merchantNo = rpUserPayConfig.getUserNo();//商户编号
+        RpUserInfo rpUserInfo = rpUserInfoService.getDataByMerchentNo(merchantNo);
+        if (rpUserInfo == null){
+            throw new UserBizException(UserBizException.USER_IS_NULL,"用户不存在");
+        }
+
+        RpTradePaymentOrder rpTradePaymentOrder = rpTradePaymentOrderDao.selectByMerchantNoAndMerchantOrderNo(merchantNo, orderNo);
+        if (rpTradePaymentOrder == null){
+            rpTradePaymentOrder = sealRpTradePaymentOrder( merchantNo,  rpUserInfo.getUserName() , productName,  orderNo,  orderDate,  orderTime,  orderPrice, payWayCode, PayWayEnum.getEnum(payWayCode).getDesc() , payType, rpUserPayConfig.getFundIntoType() ,  orderIp,  5,  "f2fPay",  "f2fPay",  remark,  field1,  field2,  field3,  field4,  field5);
             rpTradePaymentOrderDao.insert(rpTradePaymentOrder);
         }else{
             if (rpTradePaymentOrder.getOrderAmount().compareTo(orderPrice) != 0 ){
@@ -169,9 +249,106 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
             }
         }
 
-        return getScanPayResultVo(rpTradePaymentOrder , payWay);
-
+        return getF2FPayResultVo( rpTradePaymentOrder , payWay ,  payKey , rpUserPayConfig.getPaySecret() , authCode ,null);
     }
+
+    /**
+     * 通过支付订单及商户费率生成支付记录
+     * @param rpTradePaymentOrder   支付订单
+     * @param payWay   商户支付配置
+     * @return
+     */
+    private F2FPayResultVo getF2FPayResultVo(RpTradePaymentOrder rpTradePaymentOrder ,RpPayWay payWay , String  payKey , String merchantPaySecret , String authCode ,List< RoncooPayGoodsDetails > roncooPayGoodsDetailses){
+
+        F2FPayResultVo f2FPayResultVo = new F2FPayResultVo();
+        String payWayCode = payWay.getPayWayCode();//支付方式
+
+        PayTypeEnum payType = null;
+        if (PayWayEnum.WEIXIN.name().equals(payWay.getPayWayCode())){
+            payType = PayTypeEnum.SCANPAY;//TODO 微信条码支付需要修改成对应的枚举 支付类型
+        }else if(PayWayEnum.ALIPAY.name().equals(payWay.getPayWayCode())){
+            payType = PayTypeEnum.F2F_PAY;
+        }
+
+        rpTradePaymentOrder.setPayTypeCode(payType.name());//支付类型
+        rpTradePaymentOrder.setPayTypeName(payType.getDesc());//支付方式
+
+        rpTradePaymentOrder.setPayWayCode(payWay.getPayWayCode());
+        rpTradePaymentOrder.setPayWayName(payWay.getPayWayName());
+
+        RpTradePaymentRecord rpTradePaymentRecord = sealRpTradePaymentRecord(rpTradePaymentOrder.getMerchantNo(),  rpTradePaymentOrder.getMerchantName() , rpTradePaymentOrder.getProductName(),  rpTradePaymentOrder.getMerchantOrderNo(),  rpTradePaymentOrder.getOrderAmount(), payWay.getPayWayCode(),  payWay.getPayWayName() , payType, rpTradePaymentOrder.getFundIntoType()  , BigDecimal.valueOf(payWay.getPayRate()) ,  rpTradePaymentOrder.getOrderIp(),  rpTradePaymentOrder.getReturnUrl(),  rpTradePaymentOrder.getNotifyUrl(),  rpTradePaymentOrder.getRemark(),  rpTradePaymentOrder.getField1(),  rpTradePaymentOrder.getField2(),  rpTradePaymentOrder.getField3(),  rpTradePaymentOrder.getField4(),  rpTradePaymentOrder.getField5());
+        rpTradePaymentRecordDao.insert(rpTradePaymentRecord);
+
+        if (PayWayEnum.WEIXIN.name().equals(payWayCode)){//微信支付
+            throw new TradeBizException(TradeBizException.TRADE_PAY_WAY_ERROR,"暂未开通微信刷卡支付");
+        }else {
+            if (PayWayEnum.ALIPAY.name().equals(payWayCode)) {//支付宝支付
+
+                RpUserPayInfo rpUserPayInfo = rpUserPayInfoService.getByUserNo(rpTradePaymentOrder.getMerchantNo(),payWayCode);
+                if (rpUserPayInfo == null){
+                    throw new UserBizException(UserBizException.USER_PAY_CONFIG_ERRPR,"商户支付配置有误");
+                }
+
+                aliF2FPaySubmit.initConfigs(rpTradePaymentOrder.getFundIntoType(), rpUserPayInfo.getOfflineAppId(), rpUserPayInfo.getAppId(), rpUserPayInfo.getRsaPrivateKey(), rpUserPayInfo.getRsaPublicKey());
+                Map<String , String > aliPayReturnMsg = aliF2FPaySubmit.f2fPay(rpTradePaymentRecord.getBankOrderNo(), rpTradePaymentOrder.getProductName(), "", authCode, rpTradePaymentRecord.getOrderAmount(), roncooPayGoodsDetailses);
+
+                if(TradeStatusEnum.SUCCESS.name().equals(aliPayReturnMsg.get("status"))){//支付成功
+                    completeSuccessOrder( rpTradePaymentRecord ,  aliPayReturnMsg.get("bankTrxNo") ,new Date() ,  aliPayReturnMsg.get("bankReturnMsg"));
+                }else if(TradeStatusEnum.FAILED.name().equals(aliPayReturnMsg.get("status"))){//支付失败
+                    completeFailOrder(rpTradePaymentRecord , aliPayReturnMsg.get("bankReturnMsg"));
+                }else{
+                    //TODO 未知支付结果,需要在后续添加订单结果轮询功能后处理
+                }
+
+            } else {
+                throw new TradeBizException(TradeBizException.TRADE_PAY_WAY_ERROR, "错误的支付方式");
+            }
+        }
+
+        Map<String , Object> paramMap = new HashMap<String , Object>();
+        f2FPayResultVo.setStatus(rpTradePaymentRecord.getStatus());//支付结果
+        paramMap.put("status",rpTradePaymentRecord.getStatus());
+
+        f2FPayResultVo.setField1(rpTradePaymentRecord.getField1());//扩展字段1
+        paramMap.put("field1",rpTradePaymentRecord.getField1());
+
+        f2FPayResultVo.setField2(rpTradePaymentRecord.getField2());//扩展字段2
+        paramMap.put("field2",rpTradePaymentRecord.getField2());
+
+        f2FPayResultVo.setField3(rpTradePaymentRecord.getField3());//扩展字段3
+        paramMap.put("field3",rpTradePaymentRecord.getField3());
+
+        f2FPayResultVo.setField4(rpTradePaymentRecord.getField4());//扩展字段4
+        paramMap.put("field4",rpTradePaymentRecord.getField4());
+
+        f2FPayResultVo.setField5(rpTradePaymentRecord.getField5());//扩展字段5
+        paramMap.put("field5",rpTradePaymentRecord.getField5());
+
+        f2FPayResultVo.setOrderIp(rpTradePaymentRecord.getOrderIp());//下单ip
+        paramMap.put("orderIp",rpTradePaymentRecord.getOrderIp());
+
+        f2FPayResultVo.setOrderNo(rpTradePaymentRecord.getMerchantOrderNo());//商户订单号
+        paramMap.put("merchantOrderNo",rpTradePaymentRecord.getMerchantOrderNo());
+
+        f2FPayResultVo.setPayKey(payKey);//支付号
+        paramMap.put("payKey",payKey);
+
+        f2FPayResultVo.setProductName(rpTradePaymentRecord.getProductName());//产品名称
+        paramMap.put("productName",rpTradePaymentRecord.getProductName());
+
+        f2FPayResultVo.setRemark(rpTradePaymentRecord.getRemark());//支付备注
+        paramMap.put("remark",rpTradePaymentRecord.getRemark());
+
+        f2FPayResultVo.setTrxNo(rpTradePaymentRecord.getTrxNo());//交易流水号
+        paramMap.put("trxNo", rpTradePaymentRecord.getTrxNo());
+
+        String sign = MerchantApiUtil.getSign(paramMap, merchantPaySecret);
+
+        f2FPayResultVo.setSign(sign);
+        return f2FPayResultVo;
+    }
+
+
 
     /**
      * 支付成功方法
@@ -194,8 +371,12 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
                 rpAccountTransactionService.creditToAccount( rpTradePaymentRecord.getMerchantNo(), rpTradePaymentRecord.getOrderAmount().subtract(rpTradePaymentRecord.getPlatIncome()), rpTradePaymentRecord.getBankOrderNo(),rpTradePaymentRecord.getBankTrxNo(), rpTradePaymentRecord.getTrxType(), rpTradePaymentRecord.getRemark());
             }
 
-            String  notifyUrl = getMerchantNotifyUrl(rpTradePaymentRecord , rpTradePaymentOrder , rpTradePaymentRecord.getNotifyUrl() ,TradeStatusEnum.SUCCESS );
-            rpNotifyService.notifySend(notifyUrl, rpTradePaymentRecord.getMerchantOrderNo(), rpTradePaymentRecord.getMerchantNo());
+            if (PayTypeEnum.F2F_PAY.name().equals(rpTradePaymentOrder.getPayTypeCode())){//支付宝 条码支付实时返回支付结果,不需要商户通知
+                return;
+            }else{
+                String  notifyUrl = getMerchantNotifyUrl(rpTradePaymentRecord , rpTradePaymentOrder , rpTradePaymentRecord.getNotifyUrl() ,TradeStatusEnum.SUCCESS );
+                rpNotifyService.notifySend(notifyUrl, rpTradePaymentRecord.getMerchantOrderNo(), rpTradePaymentRecord.getMerchantNo());
+            }
     }
 
 
@@ -310,11 +491,17 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
 
         RpTradePaymentOrder rpTradePaymentOrder = rpTradePaymentOrderDao.selectByMerchantNoAndMerchantOrderNo(merchantNo, orderNo);
         if (rpTradePaymentOrder == null){
-            rpTradePaymentOrder = sealRpTradePaymentOrder( merchantNo,  rpUserInfo.getUserName() , productName,  orderNo,  orderDate,  orderTime,  orderPrice, null, null ,  rpUserPayConfig.getFundIntoType() ,  orderIp,  orderPeriod,  returnUrl,  notifyUrl,  remark,  field1,  field2,  field3,  field4,  field5);
+            rpTradePaymentOrder = sealRpTradePaymentOrder( merchantNo,  rpUserInfo.getUserName() , productName,  orderNo,  orderDate,  orderTime,  orderPrice, null, null ,null , rpUserPayConfig.getFundIntoType() ,  orderIp,  orderPeriod,  returnUrl,  notifyUrl,  remark,  field1,  field2,  field3,  field4,  field5);
             rpTradePaymentOrderDao.insert(rpTradePaymentOrder);
         }else{
+
+            if (TradeStatusEnum.SUCCESS.name().equals(rpTradePaymentOrder.getStatus())){
+                throw new TradeBizException(TradeBizException.TRADE_ORDER_ERROR,"订单已支付成功,无需重复支付");
+            }
+
             if (rpTradePaymentOrder.getOrderAmount().compareTo(orderPrice) != 0 ){
-                throw new TradeBizException(TradeBizException.TRADE_ORDER_ERROR,"错误的订单");
+                rpTradePaymentOrder.setOrderAmount(orderPrice);//如果金额不一致,修改金额为最新的金额
+                rpTradePaymentOrderDao.update(rpTradePaymentOrder);
             }
         }
 
@@ -396,19 +583,21 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
 
         String payWayCode = payWay.getPayWayCode();//支付方式
 
+        PayTypeEnum payType = null;
         if (PayWayEnum.WEIXIN.name().equals(payWay.getPayWayCode())){
-            rpTradePaymentOrder.setPayTypeCode(PayTypeEnum.SCANPAY.name());//支付类型
-            rpTradePaymentOrder.setPayTypeName(PayTypeEnum.SCANPAY.getDesc());//支付方式
+            payType = PayTypeEnum.SCANPAY;
         }else if(PayWayEnum.ALIPAY.name().equals(payWay.getPayWayCode())){
-            rpTradePaymentOrder.setPayTypeCode(PayTypeEnum.DIRECT_PAY.name());//支付类型
-            rpTradePaymentOrder.setPayTypeName(PayTypeEnum.DIRECT_PAY.getDesc());//支付方式
+            payType = PayTypeEnum.DIRECT_PAY;
         }
+
+        rpTradePaymentOrder.setPayTypeCode(payType.name());
+        rpTradePaymentOrder.setPayTypeName(payType.getDesc());
 
         rpTradePaymentOrder.setPayWayCode(payWay.getPayWayCode());
         rpTradePaymentOrder.setPayWayName(payWay.getPayWayName());
         rpTradePaymentOrderDao.update(rpTradePaymentOrder);
 
-        RpTradePaymentRecord rpTradePaymentRecord = sealRpTradePaymentRecord( rpTradePaymentOrder.getMerchantNo(),  rpTradePaymentOrder.getMerchantName() , rpTradePaymentOrder.getProductName(),  rpTradePaymentOrder.getMerchantOrderNo(),  rpTradePaymentOrder.getOrderAmount(), payWay.getPayWayCode(),  payWay.getPayWayName() ,  rpTradePaymentOrder.getFundIntoType()  , BigDecimal.valueOf(payWay.getPayRate()) ,  rpTradePaymentOrder.getOrderIp(),  rpTradePaymentOrder.getReturnUrl(),  rpTradePaymentOrder.getNotifyUrl(),  rpTradePaymentOrder.getRemark(),  rpTradePaymentOrder.getField1(),  rpTradePaymentOrder.getField2(),  rpTradePaymentOrder.getField3(),  rpTradePaymentOrder.getField4(),  rpTradePaymentOrder.getField5());
+        RpTradePaymentRecord rpTradePaymentRecord = sealRpTradePaymentRecord( rpTradePaymentOrder.getMerchantNo(),  rpTradePaymentOrder.getMerchantName() , rpTradePaymentOrder.getProductName(),  rpTradePaymentOrder.getMerchantOrderNo(),  rpTradePaymentOrder.getOrderAmount(), payWay.getPayWayCode(),  payWay.getPayWayName() , payType, rpTradePaymentOrder.getFundIntoType()  , BigDecimal.valueOf(payWay.getPayRate()) ,  rpTradePaymentOrder.getOrderIp(),  rpTradePaymentOrder.getReturnUrl(),  rpTradePaymentOrder.getNotifyUrl(),  rpTradePaymentOrder.getRemark(),  rpTradePaymentOrder.getField1(),  rpTradePaymentOrder.getField2(),  rpTradePaymentOrder.getField3(),  rpTradePaymentOrder.getField4(),  rpTradePaymentOrder.getField5());
         rpTradePaymentRecordDao.insert(rpTradePaymentRecord);
 
         if (PayWayEnum.WEIXIN.name().equals(payWayCode)){//微信支付
@@ -429,7 +618,7 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
 
             WeiXinPrePay weiXinPrePay = sealWeixinPerPay(appid , mch_id , rpTradePaymentOrder.getProductName() ,rpTradePaymentOrder.getRemark() , rpTradePaymentRecord.getBankOrderNo() , rpTradePaymentOrder.getOrderAmount() ,  rpTradePaymentOrder.getOrderTime() ,  rpTradePaymentOrder.getOrderPeriod() , WeiXinTradeTypeEnum.NATIVE ,
                     rpTradePaymentRecord.getBankOrderNo() ,"" ,rpTradePaymentOrder.getOrderIp());
-            String prePayXml = WeiXinPayUtils.getPrePayXml(weiXinPrePay, WeixinConfigUtil.readConfig("partnerKey"));
+            String prePayXml = WeiXinPayUtils.getPrePayXml(weiXinPrePay, partnerKey);
             //调用微信支付的功能,获取微信支付code_url
             Map<String, Object> prePayRequest = WeiXinPayUtils.httpXmlRequest(WeixinConfigUtil.readConfig("prepay_url"), "POST", prePayXml);
             if (WeixinTradeStateEnum.SUCCESS.name().equals(prePayRequest.get("return_code")) && WeixinTradeStateEnum.SUCCESS.name().equals(prePayRequest.get("result_code"))) {
@@ -642,6 +831,7 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
      * @param orderPrice    订单金额
      * @param payWay    支付方式
      * @param payWayName    支付方式名称
+     * @param payType   支付类型
      * @param fundIntoType  资金流入类型
      * @param orderIp   下单IP
      * @param orderPeriod   订单有效期
@@ -656,7 +846,7 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
      * @return
      */
     private RpTradePaymentOrder sealRpTradePaymentOrder(String merchantNo, String merchantName ,String productName, String orderNo, Date orderDate, Date orderTime, BigDecimal orderPrice,
-                                                        String payWay,String payWayName , String fundIntoType , String orderIp, Integer orderPeriod, String returnUrl, String notifyUrl, String remark, String field1, String field2, String field3, String field4, String field5){
+                                                        String payWay,String payWayName , PayTypeEnum payType , String fundIntoType , String orderIp, Integer orderPeriod, String returnUrl, String notifyUrl, String remark, String field1, String field2, String field3, String field4, String field5){
 
         RpTradePaymentOrder rpTradePaymentOrder = new RpTradePaymentOrder();
         rpTradePaymentOrder.setProductName(productName);//商品名称
@@ -715,12 +905,9 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
         rpTradePaymentOrder.setPayWayName(payWayName);//支付通道名称
         rpTradePaymentOrder.setStatus(TradeStatusEnum.WAITING_PAYMENT.name());//订单状态 等待支付
 
-        if (PayWayEnum.WEIXIN.name().equals(payWay)){
-            rpTradePaymentOrder.setPayTypeCode(PayTypeEnum.SCANPAY.name());//支付类型
-            rpTradePaymentOrder.setPayTypeName(PayTypeEnum.SCANPAY.getDesc());//支付方式
-        }else if(PayWayEnum.ALIPAY.name().equals(payWay)){
-            rpTradePaymentOrder.setPayTypeCode(PayTypeEnum.DIRECT_PAY.name());//支付类型
-            rpTradePaymentOrder.setPayTypeName(PayTypeEnum.DIRECT_PAY.getDesc());//支付方式
+        if (payType != null){
+            rpTradePaymentOrder.setPayTypeCode(payType.name());//支付类型
+            rpTradePaymentOrder.setPayTypeName(payType.getDesc());//支付方式
         }
         rpTradePaymentOrder.setFundIntoType(fundIntoType);//资金流入方向
 
@@ -744,6 +931,7 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
      * @param orderPrice    订单金额
      * @param payWay    支付方式编码
      * @param payWayName    支付方式名称
+     * @param payType   支付类型
      * @param fundIntoType  资金流入方向
      * @param feeRate   支付费率
      * @param orderIp   订单IP
@@ -757,7 +945,7 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
      * @param field5    扩展字段5
      * @return
      */
-    private RpTradePaymentRecord sealRpTradePaymentRecord(String merchantNo, String merchantName ,String productName, String orderNo, BigDecimal orderPrice , String payWay , String payWayName , String fundIntoType , BigDecimal feeRate ,
+    private RpTradePaymentRecord sealRpTradePaymentRecord(String merchantNo, String merchantName ,String productName, String orderNo, BigDecimal orderPrice , String payWay , String payWayName , PayTypeEnum payType , String fundIntoType , BigDecimal feeRate ,
                                                           String orderIp , String returnUrl, String notifyUrl, String remark, String field1, String field2, String field3, String field4, String field5){
         RpTradePaymentRecord rpTradePaymentRecord = new RpTradePaymentRecord();
         rpTradePaymentRecord.setProductName(productName);//产品名称
@@ -781,13 +969,8 @@ public class RpTradePaymentManagerServiceImpl implements RpTradePaymentManagerSe
         rpTradePaymentRecord.setOrderAmount(orderPrice);//订单金额
         rpTradePaymentRecord.setStatus(TradeStatusEnum.WAITING_PAYMENT.name());//订单状态 等待支付
 
-        if (PayWayEnum.WEIXIN.name().equals(payWay)){
-            rpTradePaymentRecord.setPayTypeCode(PayTypeEnum.SCANPAY.name());//支付类型
-            rpTradePaymentRecord.setPayTypeName(PayTypeEnum.SCANPAY.getDesc());//支付方式
-        }else if(PayWayEnum.ALIPAY.name().equals(payWay)){
-            rpTradePaymentRecord.setPayTypeCode(PayTypeEnum.DIRECT_PAY.name());//支付类型
-            rpTradePaymentRecord.setPayTypeName(PayTypeEnum.DIRECT_PAY.getDesc());//支付方式
-        }
+        rpTradePaymentRecord.setPayTypeCode(payType.name());//支付类型
+        rpTradePaymentRecord.setPayTypeName(payType.getDesc());//支付方式
         rpTradePaymentRecord.setFundIntoType(fundIntoType);//资金流入方向
 
         if (FundInfoTypeEnum.PLAT_RECEIVES.name().equals(fundIntoType)){//平台收款 需要修改费率 成本 利润 收入 以及修改商户账户信息
